@@ -1042,4 +1042,4 @@ class WallpaperAccentApp:
 
 
 if __name__ == "__main__":
-    WallpaperAccentApp().run()
+    WallpaperAccentApp().run() 
