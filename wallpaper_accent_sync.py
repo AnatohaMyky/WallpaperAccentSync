@@ -25,6 +25,8 @@ except Exception:
 SPI_GETDESKWALLPAPER = 0x0073
 SPI_SETCURSORS = 0x0057
 SPIF_UPDATEINIFILE = 0x01
+# Недокументований виклик, яким Параметри Windows застосовують CursorBaseSize без перезаходу
+SPI_SETCURSORBASESIZE = 0x2029
 SPIF_SENDCHANGE = 0x02
 
 HWND_BROADCAST = 0xFFFF
@@ -40,12 +42,17 @@ BACKUP_REG_PATH = rf"Software\{APP_NAME}\Backup"
 RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 CURSORS_REG_PATH = r"Control Panel\Cursors"
 COLORS_REG_PATH = r"Control Panel\Colors"
+ACCESSIBILITY_REG_PATH = r"Software\Microsoft\Accessibility"
+ERROR_ALREADY_EXISTS = 183
+ORIGINAL_BASE_SIZE_SETTING = "OriginalCursorBaseSize"  # розмір курсора до ручного вибору в програмі
 
 APP_DATA_DIR = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
     APP_NAME,
 )
 CURSOR_STORAGE_DIR = os.path.join(APP_DATA_DIR, "cursors")
+
+CURSOR_SIZE_PRESETS: tuple[int, ...] = (24, 32, 40, 48, 64)
 
 ALL_CURSOR_ROLES: tuple[str, ...] = (
     "Arrow",
@@ -115,7 +122,7 @@ def get_perceived_brightness(rgb: tuple[int, int, int]) -> float:
     return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
 
 
-def broadcast_settings_change(area: str = "Colors") -> None:
+def _broadcast_worker(area: str) -> None:
     try:
         result = ctypes.c_ulong()
         user32.SendMessageTimeoutW(
@@ -131,57 +138,127 @@ def broadcast_settings_change(area: str = "Colors") -> None:
         pass
 
 
+def broadcast_settings_change(area: str = "Colors") -> None:
+    """Сповіщає вікна про зміну налаштувань у фоні, щоб повільне вікно не вішало інтерфейс."""
+    threading.Thread(target=_broadcast_worker, args=(area,), daemon=True).start()
+
+
+def get_system_cursor_base_size() -> int:
+    """Зчитує базовий розмір курсора Windows із реєстру (за замовчуванням 32 px)."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CURSORS_REG_PATH, 0, winreg.KEY_READ) as key:
+            val, _ = winreg.QueryValueEx(key, "CursorBaseSize")
+            if isinstance(val, int) and 16 <= val <= 256:
+                return val
+    except OSError:
+        pass
+    return 32
+
+
+def _write_cursor_size_level(px: int) -> None:
+    """Повзунок «Розмір вказівника» в Windows: рівень 1..15, де базовий розмір = 32 + 16 * (рівень - 1)."""
+    level = max(1, min(15, round((px - 32) / 16) + 1))
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, ACCESSIBILITY_REG_PATH) as key:
+        winreg.SetValueEx(key, "CursorSize", 0, winreg.REG_DWORD, level)
+
+
+def _apply_base_size_live(px: int) -> None:
+    """Просить Windows одразу застосувати новий базовий розмір курсорів."""
+    try:
+        user32.SystemParametersInfoW(SPI_SETCURSORBASESIZE, 0, ctypes.c_void_p(int(px)), SPIF_UPDATEINIFILE)
+    except Exception:
+        pass
+
+
+def set_system_cursor_base_size(px: int) -> None:
+    """Windows масштабує курсори за CursorBaseSize, тому ручний розмір записуємо саме сюди
+    (і в Accessibility\\CursorSize, який читає сучасний інтерфейс налаштувань Windows)."""
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CURSORS_REG_PATH) as key:
+        winreg.SetValueEx(key, "CursorBaseSize", 0, winreg.REG_DWORD, int(px))
+    _write_cursor_size_level(int(px))
+    _apply_base_size_live(int(px))
+
+
 # --- Резервне копіювання початкового стану системи ---
 
+_backup_verified = False
+_instance_mutex: int | None = None
+
+
+def _load_backup() -> dict[str, tuple[Any, int]]:
+    """Зчитує всі резервні значення одним проходом: {ім'я: (значення, тип)}."""
+    result: dict[str, tuple[Any, int]] = {}
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, BACKUP_REG_PATH, 0, winreg.KEY_READ) as bkp:
+            index = 0
+            while True:
+                try:
+                    name, val, reg_type = winreg.EnumValue(bkp, index)
+                except OSError:
+                    break
+                result[name] = (val, reg_type)
+                index += 1
+    except OSError:
+        pass
+    return result
+
+
+def _backup_value(bkp: Any, src_key: Any, name: str, save_name: str, skip_own: bool = False) -> None:
+    """Копіює значення name з src_key у резервний ключ, якщо його там ще немає."""
+    missing_name = f"{save_name}_Missing"
+    for check_key in (save_name, missing_name):
+        try:
+            winreg.QueryValueEx(bkp, check_key)
+            return
+        except FileNotFoundError:
+            pass
+
+    try:
+        val, reg_type = winreg.QueryValueEx(src_key, name)
+    except FileNotFoundError:
+        winreg.SetValueEx(bkp, missing_name, 0, winreg.REG_DWORD, 1)
+        return
+    # Власні файли курсорів програми не є «початковим» станом
+    if skip_own and isinstance(val, str) and APP_NAME in val:
+        return
+    winreg.SetValueEx(bkp, save_name, 0, reg_type, val)
+
+
+def _backup_from_key(bkp: Any, reg_path: str, items: list[tuple[str, str, bool]]) -> None:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_READ) as src:
+            for name, save_name, skip_own in items:
+                _backup_value(bkp, src, name, save_name, skip_own)
+    except OSError:
+        pass
+
+
 def ensure_initial_backup() -> None:
-    """Зберігає початкові курсори (усі 17 станів) та кольори виділення перед зміною."""
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, BACKUP_REG_PATH) as bkp:
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CURSORS_REG_PATH, 0, winreg.KEY_READ) as cur_key:
-                for role in ("",) + ALL_CURSOR_ROLES:
-                    save_name = "Cursor_Scheme" if role == "" else f"Cursor_{role}"
-                    missing_name = f"{save_name}_Missing"
+    """Зберігає початкові курсори (усі 17 станів, розмір, схему), стиль вказівника та кольори виділення."""
+    global _backup_verified
+    if _backup_verified:
+        return
 
-                    already_saved = False
-                    for check_key in (save_name, missing_name):
-                        try:
-                            winreg.QueryValueEx(bkp, check_key)
-                            already_saved = True
-                            break
-                        except FileNotFoundError:
-                            pass
-                    if already_saved:
-                        continue
+    cursor_items: list[tuple[str, str, bool]] = [
+        (role, "Cursor_Scheme" if role == "" else f"Cursor_{role}", True)
+        for role in ("",) + ALL_CURSOR_ROLES
+    ]
+    cursor_items.append(("CursorBaseSize", "CursorBaseSize", False))
+    cursor_items.append(("Scheme Source", "Cursor_SchemeSource", False))
 
-                    try:
-                        val, reg_type = winreg.QueryValueEx(cur_key, role)
-                        if isinstance(val, str) and "WallpaperAccentSync" in val:
-                            continue
-                        winreg.SetValueEx(bkp, save_name, 0, reg_type, val)
-                    except FileNotFoundError:
-                        winreg.SetValueEx(bkp, missing_name, 0, winreg.REG_DWORD, 1)
-        except OSError:
-            pass
-
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, COLORS_REG_PATH, 0, winreg.KEY_READ) as col_key:
-                for name in ("Hilight", "HotTrackingColor"):
-                    save_name = f"Color_{name}"
-                    try:
-                        winreg.QueryValueEx(bkp, save_name)
-                        continue
-                    except FileNotFoundError:
-                        pass
-
-                    try:
-                        val, reg_type = winreg.QueryValueEx(col_key, name)
-                        winreg.SetValueEx(bkp, save_name, 0, reg_type, val)
-                    except FileNotFoundError:
-                        pass
-        except OSError:
-            pass
-
+    with winreg.CreateKeyEx(
+        winreg.HKEY_CURRENT_USER, BACKUP_REG_PATH, 0, winreg.KEY_READ | winreg.KEY_WRITE
+    ) as bkp:
+        _backup_from_key(bkp, CURSORS_REG_PATH, cursor_items)
+        _backup_from_key(bkp, ACCESSIBILITY_REG_PATH, [("CursorType", "Accessibility_CursorType", False)])
+        _backup_from_key(
+            bkp,
+            COLORS_REG_PATH,
+            [("Hilight", "Color_Hilight", False), ("HotTrackingColor", "Color_HotTrackingColor", False)],
+        )
         winreg.SetValueEx(bkp, "Initialized", 0, winreg.REG_DWORD, 1)
+
+    _backup_verified = True
 
 
 def cleanup_cursor_files() -> None:
@@ -194,17 +271,21 @@ def cleanup_cursor_files() -> None:
 
 # --- Генерація статичних (.cur) та анімованих (.ani) курсорів Windows ---
 
-def build_cur_bytes(img: Image.Image, hotspot_x: int = 0, hotspot_y: int = 0) -> bytes:
-    """Кодує 32x32 RGBA-зображення у бінарний формат курсора Windows (.cur)."""
+def scale_hotspot(hotspot_32: tuple[int, int], target_size: int) -> tuple[int, int]:
+    scale = target_size / 32.0
+    return (
+        max(0, min(target_size - 1, round(hotspot_32[0] * scale))),
+        max(0, min(target_size - 1, round(hotspot_32[1] * scale))),
+    )
+
+
+def _cur_dib(img: Image.Image) -> bytes:
+    """Одне зображення курсора у вигляді DIB (BITMAPINFOHEADER + піксели + AND-маска)."""
     img = img.convert("RGBA")
     w, h = img.size
 
-    xor_rows = bytearray()
-    pixels = img.load()
-    for y in range(h - 1, -1, -1):
-        for x in range(w):
-            r, g, b, a = pixels[x, y]
-            xor_rows.extend((b, g, r, a))
+    # DIB зберігається знизу вгору й у порядку BGRA — це робить сам Pillow (швидко, без циклів)
+    xor_rows = img.transpose(Image.Transpose.FLIP_TOP_BOTTOM).tobytes("raw", "BGRA")
 
     and_row_size = ((w + 31) // 32) * 4
     and_rows = bytes(and_row_size * h)
@@ -223,20 +304,28 @@ def build_cur_bytes(img: Image.Image, hotspot_x: int = 0, hotspot_y: int = 0) ->
         0,
         0,
     )
-    image_data = bih + bytes(xor_rows) + and_rows
-    header = struct.pack("<HHH", 0, 2, 1)
-    entry = struct.pack(
-        "<BBBBHHII",
-        w if w < 256 else 0,
-        h if h < 256 else 0,
-        0,
-        0,
-        hotspot_x,
-        hotspot_y,
-        len(image_data),
-        6 + 16,
-    )
-    return header + entry + image_data
+    return bih + xor_rows + and_rows
+
+
+def build_multi_cur_bytes(images: list[tuple[Image.Image, int, int]]) -> bytes:
+    """Кодує набір зображень (img, hotspot_x, hotspot_y) у один файл .cur з кількома розмірами."""
+    blobs = [_cur_dib(img) for img, _, _ in images]
+    offset = 6 + 16 * len(images)
+    entries = bytearray()
+    for (img, hx, hy), blob in zip(images, blobs):
+        w, h = img.size
+        entries.extend(
+            struct.pack(
+                "<BBBBHHII", w if w < 256 else 0, h if h < 256 else 0, 0, 0, hx, hy, len(blob), offset
+            )
+        )
+        offset += len(blob)
+    return struct.pack("<HHH", 0, 2, len(images)) + bytes(entries) + b"".join(blobs)
+
+
+def build_cur_bytes(img: Image.Image, hotspot_x: int = 0, hotspot_y: int = 0) -> bytes:
+    """Кодує RGBA-зображення у бінарний формат курсора Windows (.cur)."""
+    return build_multi_cur_bytes([(img, hotspot_x, hotspot_y)])
 
 
 def save_cur_file(img: Image.Image, path: str, hotspot_x: int = 0, hotspot_y: int = 0) -> None:
@@ -245,17 +334,34 @@ def save_cur_file(img: Image.Image, path: str, hotspot_x: int = 0, hotspot_y: in
         f.write(build_cur_bytes(img, hotspot_x=hotspot_x, hotspot_y=hotspot_y))
 
 
+# Windows сама обирає зображення, найближче до потрібного їй розміру, тож у файл кладемо кілька
+CURSOR_IMAGE_SIZES: tuple[int, ...] = (32, 48, 64)
+
+
+def save_cursor_canvas(
+    canvas: Image.Image, path: str, hotspot_32: tuple[int, int], target_size: int
+) -> None:
+    """Зберігає 128-px полотно як .cur одразу в кількох розмірах (цільовий + стандартні)."""
+    images = []
+    for s in sorted({target_size, *CURSOR_IMAGE_SIZES}):
+        hx, hy = scale_hotspot(hotspot_32, s)
+        images.append((canvas.resize((s, s), Image.Resampling.LANCZOS), hx, hy))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(build_multi_cur_bytes(images))
+
+
 def save_ani_file(
-    frames_32: list[Image.Image],
+    frames: list[Image.Image],
     path: str,
     hotspot_x: int,
     hotspot_y: int,
     jiffies_per_frame: int = 5,
 ) -> None:
-    """Зберігає серію 32x32 RGBA-кадрів в анімований курсор Windows (.ani)."""
-    n_frames = len(frames_32)
+    """Зберігає серію RGBA-кадрів в анімований курсор Windows (.ani)."""
+    n_frames = len(frames)
     icon_chunks = bytearray()
-    for frame in frames_32:
+    for frame in frames:
         cur_data = build_cur_bytes(frame, hotspot_x=hotspot_x, hotspot_y=hotspot_y)
         icon_chunks.extend(b"icon")
         icon_chunks.extend(struct.pack("<I", len(cur_data)))
@@ -266,7 +372,6 @@ def save_ani_file(
     fram_payload = b"fram" + bytes(icon_chunks)
     list_chunk = b"LIST" + struct.pack("<I", len(fram_payload)) + fram_payload
 
-    # anih header: cbSize=36, nFrames, nSteps, w=0, h=0, bpp=0, planes=0, jifRate, flags=1 (AF_ICON)
     anih_data = struct.pack(
         "<9I",
         36,
@@ -321,26 +426,22 @@ def _draw_spinner_ring(
     ring = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     r_draw = ImageDraw.Draw(ring)
 
-    # Зовнішній контур кільця
     r_draw.ellipse(
         (cx - outer_r, cy - outer_r, cx + outer_r, cy + outer_r),
         fill=outline_rgba,
     )
-    # Напівпрозора підкладка треку
     track_r = outer_r - 4
     track_fill = (fill_rgba[0], fill_rgba[1], fill_rgba[2], 95)
     r_draw.ellipse(
         (cx - track_r, cy - track_r, cx + track_r, cy + track_r),
         fill=track_fill,
     )
-    # Активний сектор обертання
     r_draw.pieslice(
         (cx - track_r, cy - track_r, cx + track_r, cy + track_r),
         start=angle_deg,
         end=angle_deg + 145,
         fill=fill_rgba,
     )
-    # Внутрішній контур і прозорий отвір усередині
     r_draw.ellipse(
         (cx - inner_r - 4, cy - inner_r - 4, cx + inner_r + 4, cy + inner_r + 4),
         fill=outline_rgba,
@@ -358,44 +459,45 @@ def _render_polygon_cur(
     rgb: tuple[int, int, int],
     hotspot_32: tuple[int, int],
     out_path: str,
+    target_size: int = 32,
     outline_width: int = 7,
 ) -> None:
     fill_rgba, outline_rgba = _get_cursor_colors(rgb)
     canvas = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     _draw_outlined_polygon(draw, pts_128, fill_rgba, outline_rgba, outline_width=outline_width)
-    final_img = canvas.resize((32, 32), Image.Resampling.LANCZOS)
-    save_cur_file(final_img, out_path, hotspot_x=hotspot_32[0], hotspot_y=hotspot_32[1])
+    save_cursor_canvas(canvas, out_path, hotspot_32, target_size)
 
 
-def generate_colored_cursors(rgb: tuple[int, int, int]) -> dict[str, str]:
-    """Створює повний набір з 17 системних курсорів із заданим акцентним кольором."""
+def generate_colored_cursors(rgb: tuple[int, int, int], target_size: int = 32) -> dict[str, str]:
+    """Створює повний набір з 17 системних курсорів із заданим акцентним кольором і розміром."""
+    size = max(16, min(128, int(target_size)))
     fill_rgba, outline_rgba = _get_cursor_colors(rgb)
     paths: dict[str, str] = {}
 
     def p(filename: str) -> str:
         return os.path.join(CURSOR_STORAGE_DIR, filename)
 
-    # 1. Arrow (Основний режим)
-    arrow_pts = [(12, 8), (12, 104), (36, 82), (52, 118), (66, 112), (50, 76), (82, 76)]
+    # 1. Arrow (Основний режим — пропорції наближені до стандартного курсора Windows)
+    arrow_pts = [(12, 8), (12, 88), (31, 70), (44, 100), (56, 95), (43, 65), (70, 65)]
     paths["Arrow"] = p("accent_arrow.cur")
-    _render_polygon_cur(arrow_pts, rgb, (3, 2), paths["Arrow"])
+    _render_polygon_cur(arrow_pts, rgb, (3, 2), paths["Arrow"], target_size=size, outline_width=6)
 
     # 2. Help (Вибір довідки: стрілка + знак питання)
     paths["Help"] = p("accent_help.cur")
     c_help = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
     d_help = ImageDraw.Draw(c_help)
-    small_arrow = [(10, 8), (10, 86), (29, 68), (42, 98), (54, 93), (41, 63), (67, 63)]
+    small_arrow = [(10, 8), (10, 76), (26, 61), (37, 87), (47, 83), (36, 57), (59, 57)]
     _draw_outlined_polygon(d_help, small_arrow, fill_rgba, outline_rgba, outline_width=6)
-    # Знак питання праворуч знизу
     q_top = [
-        (76, 56), (92, 48), (110, 52), (116, 66), (112, 80),
-        (99, 88), (99, 95), (87, 95), (87, 81), (100, 73),
-        (102, 65), (95, 60), (85, 64), (76, 64),
+        (68, 50), (83, 43), (99, 46), (105, 59), (101, 72),
+        (89, 79), (89, 85), (78, 85), (78, 72), (90, 65),
+        (92, 58), (85, 53), (76, 57), (68, 57),
     ]
     _draw_outlined_polygon(d_help, q_top, fill_rgba, outline_rgba, outline_width=5)
-    d_help.ellipse((85, 101, 101, 117), fill=fill_rgba, outline=outline_rgba, width=5)
-    save_cur_file(c_help.resize((32, 32), Image.Resampling.LANCZOS), paths["Help"], 3, 2)
+    d_help.ellipse((76, 91, 91, 106), fill=fill_rgba, outline=outline_rgba, width=5)
+    hx, hy = scale_hotspot((3, 2), size)
+    save_cursor_canvas(c_help, paths["Help"], (3, 2), size)
 
     # 3. AppStarting (Фоновий режим: стрілка + анімоване кільце завантаження)
     paths["AppStarting"] = p("accent_appstarting.ani")
@@ -404,137 +506,138 @@ def generate_colored_cursors(rgb: tuple[int, int, int]) -> dict[str, str]:
         frame = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
         d_f = ImageDraw.Draw(frame)
         _draw_outlined_polygon(d_f, small_arrow, fill_rgba, outline_rgba, outline_width=6)
-        _draw_spinner_ring(frame, cx=92, cy=90, outer_r=26, inner_r=12, angle_deg=step * 45, fill_rgba=fill_rgba, outline_rgba=outline_rgba)
-        app_frames.append(frame.resize((32, 32), Image.Resampling.LANCZOS))
-    save_ani_file(app_frames, paths["AppStarting"], hotspot_x=3, hotspot_y=2, jiffies_per_frame=5)
+        _draw_spinner_ring(frame, cx=82, cy=80, outer_r=23, inner_r=11, angle_deg=step * 45, fill_rgba=fill_rgba, outline_rgba=outline_rgba)
+        app_frames.append(frame.resize((size, size), Image.Resampling.LANCZOS))
+    save_ani_file(app_frames, paths["AppStarting"], hotspot_x=hx, hotspot_y=hy, jiffies_per_frame=5)
 
     # 4. Wait (Зайнятий / Завантаження: центроване анімоване кільце)
     paths["Wait"] = p("accent_wait.ani")
     wait_frames: list[Image.Image] = []
     for step in range(8):
         frame = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
-        _draw_spinner_ring(frame, cx=64, cy=64, outer_r=44, inner_r=24, angle_deg=step * 45, fill_rgba=fill_rgba, outline_rgba=outline_rgba)
-        wait_frames.append(frame.resize((32, 32), Image.Resampling.LANCZOS))
-    save_ani_file(wait_frames, paths["Wait"], hotspot_x=16, hotspot_y=16, jiffies_per_frame=5)
+        _draw_spinner_ring(frame, cx=64, cy=64, outer_r=38, inner_r=20, angle_deg=step * 45, fill_rgba=fill_rgba, outline_rgba=outline_rgba)
+        wait_frames.append(frame.resize((size, size), Image.Resampling.LANCZOS))
+    chx, chy = scale_hotspot((16, 16), size)
+    save_ani_file(wait_frames, paths["Wait"], hotspot_x=chx, hotspot_y=chy, jiffies_per_frame=5)
 
     # 5. Crosshair (Графічне виділення)
     cross_pts = [
-        (58, 16), (70, 16), (70, 58), (112, 58), (112, 70), (70, 70),
-        (70, 112), (58, 112), (58, 70), (16, 70), (16, 58), (58, 58),
+        (58, 20), (70, 20), (70, 58), (108, 58), (108, 70), (70, 70),
+        (70, 108), (58, 108), (58, 70), (20, 70), (20, 58), (58, 58),
     ]
     paths["Crosshair"] = p("accent_cross.cur")
-    _render_polygon_cur(cross_pts, rgb, (16, 16), paths["Crosshair"], outline_width=6)
+    _render_polygon_cur(cross_pts, rgb, (16, 16), paths["Crosshair"], target_size=size, outline_width=6)
 
     # 6. IBeam (Виділення тексту)
     ibeam_pts = [
-        (44, 16), (84, 16), (84, 26), (69, 26), (69, 102), (84, 102),
-        (84, 112), (44, 112), (44, 102), (59, 102), (59, 26), (44, 26),
+        (46, 20), (82, 20), (82, 29), (69, 29), (69, 99), (82, 99),
+        (82, 108), (46, 108), (46, 99), (59, 99), (59, 29), (46, 29),
     ]
     paths["IBeam"] = p("accent_ibeam.cur")
-    _render_polygon_cur(ibeam_pts, rgb, (16, 16), paths["IBeam"], outline_width=5)
+    _render_polygon_cur(ibeam_pts, rgb, (16, 16), paths["IBeam"], target_size=size, outline_width=5)
 
     # 7. NWPen (Рукописний ввід)
-    pen_pts = [(12, 116), (34, 110), (108, 36), (92, 20), (18, 94)]
+    pen_pts = [(16, 112), (36, 106), (102, 40), (88, 26), (22, 92)]
     paths["NWPen"] = p("accent_nwpen.cur")
-    _render_polygon_cur(pen_pts, rgb, (3, 29), paths["NWPen"], outline_width=6)
+    _render_polygon_cur(pen_pts, rgb, (4, 28), paths["NWPen"], target_size=size, outline_width=6)
 
     # 8. No (Недоступно: перекреслене кільце)
     paths["No"] = p("accent_no.cur")
     c_no = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
     no_ring = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
     d_no = ImageDraw.Draw(no_ring)
-    d_no.ellipse((20, 20, 108, 108), fill=outline_rgba)
-    d_no.ellipse((25, 25, 103, 103), fill=fill_rgba)
-    d_no.ellipse((37, 37, 91, 91), fill=outline_rgba)
-    d_no.ellipse((42, 42, 86, 86), fill=(0, 0, 0, 0))
+    d_no.ellipse((24, 24, 104, 104), fill=outline_rgba)
+    d_no.ellipse((29, 29, 99, 99), fill=fill_rgba)
+    d_no.ellipse((40, 40, 88, 88), fill=outline_rgba)
+    d_no.ellipse((45, 45, 83, 83), fill=(0, 0, 0, 0))
     c_no.alpha_composite(no_ring)
-    slash_pts = [(33, 41), (41, 33), (95, 87), (87, 95)]
+    slash_pts = [(36, 44), (44, 36), (92, 84), (84, 92)]
     _draw_outlined_polygon(ImageDraw.Draw(c_no), slash_pts, fill_rgba, outline_rgba, outline_width=5)
-    save_cur_file(c_no.resize((32, 32), Image.Resampling.LANCZOS), paths["No"], 16, 16)
+    save_cursor_canvas(c_no, paths["No"], (16, 16), size)
 
     # 9. SizeNS (Вертикальна зміна розміру)
     size_ns_pts = [
-        (64, 12), (86, 36), (71, 36), (71, 92), (86, 92),
-        (64, 116), (42, 92), (57, 92), (57, 36), (42, 36),
+        (64, 16), (84, 38), (70, 38), (70, 90), (84, 90),
+        (64, 112), (44, 90), (58, 90), (58, 38), (44, 38),
     ]
     paths["SizeNS"] = p("accent_sizens.cur")
-    _render_polygon_cur(size_ns_pts, rgb, (16, 16), paths["SizeNS"], outline_width=6)
+    _render_polygon_cur(size_ns_pts, rgb, (16, 16), paths["SizeNS"], target_size=size, outline_width=6)
 
     # 10. SizeWE (Горизонтальна зміна розміру)
     size_we_pts = [
-        (12, 64), (36, 42), (36, 57), (92, 57), (92, 42),
-        (116, 64), (92, 86), (92, 71), (36, 71), (36, 86),
+        (16, 64), (38, 44), (38, 58), (90, 58), (90, 44),
+        (112, 64), (90, 84), (90, 70), (38, 70), (38, 84),
     ]
     paths["SizeWE"] = p("accent_sizewe.cur")
-    _render_polygon_cur(size_we_pts, rgb, (16, 16), paths["SizeWE"], outline_width=6)
+    _render_polygon_cur(size_we_pts, rgb, (16, 16), paths["SizeWE"], target_size=size, outline_width=6)
 
     # 11. SizeNWSE (Діагональна зміна розміру 1)
     size_nwse_pts = [
-        (22, 22), (58, 26), (47, 37), (91, 81), (102, 70),
-        (106, 106), (70, 102), (81, 91), (37, 47), (26, 58),
+        (26, 26), (58, 30), (48, 40), (88, 80), (98, 70),
+        (102, 102), (70, 98), (80, 88), (40, 48), (30, 58),
     ]
     paths["SizeNWSE"] = p("accent_sizenwse.cur")
-    _render_polygon_cur(size_nwse_pts, rgb, (16, 16), paths["SizeNWSE"], outline_width=6)
+    _render_polygon_cur(size_nwse_pts, rgb, (16, 16), paths["SizeNWSE"], target_size=size, outline_width=6)
 
     # 12. SizeNESW (Діагональна зміна розміру 2)
     size_nesw_pts = [
-        (106, 22), (70, 26), (81, 37), (37, 81), (26, 70),
-        (22, 106), (58, 102), (47, 91), (91, 47), (102, 58),
+        (102, 26), (70, 30), (80, 40), (40, 80), (30, 70),
+        (26, 102), (58, 98), (48, 88), (88, 48), (98, 58),
     ]
     paths["SizeNESW"] = p("accent_sizenesw.cur")
-    _render_polygon_cur(size_nesw_pts, rgb, (16, 16), paths["SizeNESW"], outline_width=6)
+    _render_polygon_cur(size_nesw_pts, rgb, (16, 16), paths["SizeNESW"], target_size=size, outline_width=6)
 
     # 13. SizeAll (Переміщення)
     size_all_pts = [
-        (64, 10), (82, 30), (70, 30), (70, 58), (98, 58), (98, 46),
-        (118, 64), (98, 82), (98, 70), (70, 70), (70, 98), (82, 98),
-        (64, 118), (46, 98), (58, 98), (58, 70), (30, 70), (30, 82),
-        (10, 64), (30, 46), (30, 58), (58, 58), (58, 30), (46, 30),
+        (64, 14), (80, 32), (70, 32), (70, 58), (96, 58), (96, 48),
+        (114, 64), (96, 80), (96, 70), (70, 70), (70, 96), (80, 96),
+        (64, 114), (48, 96), (58, 96), (58, 70), (32, 70), (32, 80),
+        (14, 64), (32, 48), (32, 58), (58, 58), (58, 32), (48, 32),
     ]
     paths["SizeAll"] = p("accent_sizeall.cur")
-    _render_polygon_cur(size_all_pts, rgb, (16, 16), paths["SizeAll"], outline_width=5)
+    _render_polygon_cur(size_all_pts, rgb, (16, 16), paths["SizeAll"], target_size=size, outline_width=5)
 
     # 14. UpArrow (Альтернативний вибір)
-    up_arrow_pts = [(64, 12), (92, 46), (73, 46), (73, 114), (55, 114), (55, 46), (36, 46)]
+    up_arrow_pts = [(64, 16), (88, 46), (72, 46), (72, 108), (56, 108), (56, 46), (40, 46)]
     paths["UpArrow"] = p("accent_uparrow.cur")
-    _render_polygon_cur(up_arrow_pts, rgb, (16, 3), paths["UpArrow"], outline_width=6)
+    _render_polygon_cur(up_arrow_pts, rgb, (16, 4), paths["UpArrow"], target_size=size, outline_width=6)
 
     # 15. Hand (Вибір посилання)
     hand_pts = [
-        (44, 12), (56, 12), (56, 48), (70, 48), (70, 52), (84, 52), (84, 58),
-        (96, 58), (96, 86), (88, 106), (38, 106), (22, 76), (30, 66), (44, 72),
+        (42, 10), (52, 10), (52, 42), (64, 42), (64, 46), (76, 46), (76, 51),
+        (87, 51), (87, 76), (80, 94), (36, 94), (22, 68), (29, 59), (42, 64),
     ]
     paths["Hand"] = p("accent_hand.cur")
-    _render_polygon_cur(hand_pts, rgb, (12, 3), paths["Hand"], outline_width=7)
+    _render_polygon_cur(hand_pts, rgb, (11, 2), paths["Hand"], target_size=size, outline_width=6)
 
     # 16. Pin (Вибір розташування)
     paths["Pin"] = p("accent_pin.cur")
     c_pin = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
     d_pin = ImageDraw.Draw(c_pin)
     _draw_outlined_polygon(d_pin, small_arrow, fill_rgba, outline_rgba, outline_width=6)
-    pin_pts = [(94, 52), (110, 60), (114, 78), (94, 114), (74, 78), (78, 60)]
+    pin_pts = [(85, 48), (100, 55), (103, 71), (85, 104), (67, 71), (70, 55)]
     _draw_outlined_polygon(d_pin, pin_pts, fill_rgba, outline_rgba, outline_width=5)
-    d_pin.ellipse((87, 67, 101, 81), fill=outline_rgba)
-    save_cur_file(c_pin.resize((32, 32), Image.Resampling.LANCZOS), paths["Pin"], 3, 2)
+    d_pin.ellipse((79, 61, 91, 73), fill=outline_rgba)
+    save_cursor_canvas(c_pin, paths["Pin"], (3, 2), size)
 
     # 17. Person (Вибір користувача)
     paths["Person"] = p("accent_person.cur")
     c_per = Image.new("RGBA", (128, 128), (0, 0, 0, 0))
     d_per = ImageDraw.Draw(c_per)
     _draw_outlined_polygon(d_per, small_arrow, fill_rgba, outline_rgba, outline_width=6)
-    shoulders_pts = [(70, 114), (74, 94), (86, 88), (102, 88), (114, 94), (118, 114)]
+    shoulders_pts = [(64, 104), (68, 86), (79, 80), (93, 80), (104, 86), (108, 104)]
     _draw_outlined_polygon(d_per, shoulders_pts, fill_rgba, outline_rgba, outline_width=5)
-    d_per.ellipse((81, 56, 107, 82), fill=fill_rgba, outline=outline_rgba, width=5)
-    save_cur_file(c_per.resize((32, 32), Image.Resampling.LANCZOS), paths["Person"], 3, 2)
+    d_per.ellipse((74, 50, 98, 74), fill=fill_rgba, outline=outline_rgba, width=5)
+    save_cursor_canvas(c_per, paths["Person"], (3, 2), size)
 
     return paths
 
 
-def apply_cursor_color(rgb: tuple[int, int, int]) -> None:
+def apply_cursor_color(rgb: tuple[int, int, int], target_size: int = 32) -> None:
     ensure_initial_backup()
-    paths = generate_colored_cursors(rgb)
+    paths = generate_colored_cursors(rgb, target_size=target_size)
 
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Accessibility") as key:
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, ACCESSIBILITY_REG_PATH) as key:
         winreg.SetValueEx(key, "CursorType", 0, winreg.REG_DWORD, 0)
 
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CURSORS_REG_PATH) as key:
@@ -547,34 +650,45 @@ def apply_cursor_color(rgb: tuple[int, int, int]) -> None:
 
 
 def reset_cursor_to_default() -> None:
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Accessibility") as key:
-        winreg.SetValueEx(key, "CursorType", 0, winreg.REG_DWORD, 0)
+    backup = _load_backup()
+
+    # Повертаємо початковий стиль вказівника (білий/чорний/інверсний), а не завжди 0
+    saved_type = backup.get("Accessibility_CursorType", (0,))[0]
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, ACCESSIBILITY_REG_PATH) as key:
+        winreg.SetValueEx(
+            key, "CursorType", 0, winreg.REG_DWORD, saved_type if isinstance(saved_type, int) else 0
+        )
 
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CURSORS_REG_PATH) as cur_key:
-        restored_from_bkp = False
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, BACKUP_REG_PATH, 0, winreg.KEY_READ) as bkp:
-                for role in ("",) + ALL_CURSOR_ROLES:
-                    save_name = "Cursor_Scheme" if role == "" else f"Cursor_{role}"
-                    try:
-                        val, reg_type = winreg.QueryValueEx(bkp, save_name)
-                        if isinstance(val, str) and "WallpaperAccentSync" not in val:
-                            winreg.SetValueEx(cur_key, role, 0, reg_type, val)
-                            restored_from_bkp = True
-                            continue
-                    except FileNotFoundError:
-                        pass
+        for role in ("",) + ALL_CURSOR_ROLES:
+            save_name = "Cursor_Scheme" if role == "" else f"Cursor_{role}"
+            saved = backup.get(save_name)
+            if saved and isinstance(saved[0], str) and APP_NAME not in saved[0]:
+                val, reg_type = saved
+            else:
+                val, reg_type = FALLBACK_DEFAULT_CURSORS[role]
+            winreg.SetValueEx(cur_key, role, 0, reg_type, val)
 
-                    fb_val, fb_type = FALLBACK_DEFAULT_CURSORS[role]
-                    winreg.SetValueEx(cur_key, role, 0, fb_type, fb_val)
-        except OSError:
-            pass
+        # Розмір, який користувач мав до ручного вибору в програмі, актуальніший за початковий backup
+        orig_size = load_int_setting(ORIGINAL_BASE_SIZE_SETTING, 0)
+        final_base: int | None = None
+        if orig_size:
+            final_base = orig_size
+            save_int_setting(ORIGINAL_BASE_SIZE_SETTING, 0)
+        elif backup:
+            base = backup.get("CursorBaseSize")
+            final_base = base[0] if base and isinstance(base[0], int) else 32
+        if final_base is not None:
+            winreg.SetValueEx(cur_key, "CursorBaseSize", 0, winreg.REG_DWORD, final_base)
 
-        if not restored_from_bkp:
-            for role, (fb_val, fb_type) in FALLBACK_DEFAULT_CURSORS.items():
-                winreg.SetValueEx(cur_key, role, 0, fb_type, fb_val)
+        source = backup.get("Cursor_SchemeSource", (2,))[0]
+        winreg.SetValueEx(
+            cur_key, "Scheme Source", 0, winreg.REG_DWORD, source if isinstance(source, int) else 2
+        )
 
-        winreg.SetValueEx(cur_key, "Scheme Source", 0, winreg.REG_DWORD, 2)
+    if final_base is not None:
+        _write_cursor_size_level(final_base)
+        _apply_base_size_live(final_base)
 
     cleanup_cursor_files()
     user32.SystemParametersInfoW(
@@ -605,44 +719,27 @@ def apply_selection_color(rgb: tuple[int, int, int]) -> None:
     broadcast_settings_change("Colors")
 
 
-def reset_selection_to_default() -> None:
-    hilight_str = "0 120 215"
-    hot_str = "0 102 204"
-
+def parse_rgb_str(value: Any, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Розбирає рядок реєстру виду "0 120 215"; за будь-якої аномалії повертає fallback."""
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, BACKUP_REG_PATH, 0, winreg.KEY_READ) as bkp:
-            try:
-                val, _ = winreg.QueryValueEx(bkp, "Color_Hilight")
-                if isinstance(val, str) and len(val.split()) == 3:
-                    hilight_str = val
-            except FileNotFoundError:
-                pass
-            try:
-                val, _ = winreg.QueryValueEx(bkp, "Color_HotTrackingColor")
-                if isinstance(val, str) and len(val.split()) == 3:
-                    hot_str = val
-            except FileNotFoundError:
-                pass
-    except OSError:
+        parts = [int(p) for p in str(value).split()]
+        if len(parts) == 3 and all(0 <= p <= 255 for p in parts):
+            return (parts[0], parts[1], parts[2])
+    except ValueError:
         pass
+    return fallback
+
+
+def reset_selection_to_default() -> None:
+    backup = _load_backup()
+    hi_rgb = parse_rgb_str(backup.get("Color_Hilight", ("",))[0], (0, 120, 215))
+    hot_rgb = parse_rgb_str(backup.get("Color_HotTrackingColor", ("",))[0], (0, 102, 204))
 
     with winreg.OpenKey(
         winreg.HKEY_CURRENT_USER, COLORS_REG_PATH, 0, winreg.KEY_SET_VALUE
     ) as key:
-        winreg.SetValueEx(key, "HotTrackingColor", 0, winreg.REG_SZ, hot_str)
-        winreg.SetValueEx(key, "Hilight", 0, winreg.REG_SZ, hilight_str)
-
-    def parse_rgb_str(s: str, fb: tuple[int, int, int]) -> tuple[int, int, int]:
-        try:
-            parts = [int(p) for p in s.split()]
-            if len(parts) == 3:
-                return (parts[0], parts[1], parts[2])
-        except ValueError:
-            pass
-        return fb
-
-    hi_rgb = parse_rgb_str(hilight_str, (0, 120, 215))
-    hot_rgb = parse_rgb_str(hot_str, (0, 102, 204))
+        winreg.SetValueEx(key, "HotTrackingColor", 0, winreg.REG_SZ, "{} {} {}".format(*hot_rgb))
+        winreg.SetValueEx(key, "Hilight", 0, winreg.REG_SZ, "{} {} {}".format(*hi_rgb))
 
     elements = (ctypes.c_int * 2)(COLOR_HIGHLIGHT, COLOR_HOTLIGHT)
     colors = (ctypes.c_int * 2)(
@@ -653,8 +750,26 @@ def reset_selection_to_default() -> None:
     broadcast_settings_change("Colors")
 
 
+def delete_registry_tree(root: Any, path: str) -> None:
+    """Рекурсивно видаляє гілку реєстру (у модулі winreg немає функції DeleteTree)."""
+    try:
+        with winreg.OpenKey(root, path, 0, winreg.KEY_READ) as key:
+            children: list[str] = []
+            while True:
+                try:
+                    children.append(winreg.EnumKey(key, len(children)))
+                except OSError:
+                    break
+    except FileNotFoundError:
+        return
+    for child in children:
+        delete_registry_tree(root, f"{path}\\{child}")
+    winreg.DeleteKey(root, path)
+
+
 def perform_full_uninstall_cleanup() -> None:
     """Повністю відкатує зміни в системі та видаляє всі сліди програми з реєстру й диска."""
+    global _backup_verified
     reset_cursor_to_default()
     reset_selection_to_default()
     set_autostart_enabled(False)
@@ -666,11 +781,10 @@ def perform_full_uninstall_cleanup() -> None:
         pass
 
     try:
-        winreg.DeleteTree(winreg.HKEY_CURRENT_USER, APP_REG_PATH)
-    except FileNotFoundError:
-        pass
+        delete_registry_tree(winreg.HKEY_CURRENT_USER, APP_REG_PATH)
     except OSError:
         pass
+    _backup_verified = False
 
 
 def save_active_accent_meta(
@@ -683,29 +797,49 @@ def save_active_accent_meta(
         winreg.SetValueEx(key, "SelectionHex", 0, winreg.REG_SZ, rgb_to_hex(selection_rgb))
 
 
-def load_color_setting(name: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+def _read_setting(name: str) -> Any:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APP_REG_PATH, 0, winreg.KEY_READ) as key:
-            val, _ = winreg.QueryValueEx(key, name)
-            if isinstance(val, str):
-                return hex_to_rgb(val, fallback)
+            return winreg.QueryValueEx(key, name)[0]
     except OSError:
-        pass
-    return fallback
+        return None
+
+
+def _write_setting(name: str, reg_type: int, value: Any) -> None:
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, APP_REG_PATH) as key:
+        winreg.SetValueEx(key, name, 0, reg_type, value)
+
+
+def load_color_setting(name: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    val = _read_setting(name)
+    return hex_to_rgb(val, fallback) if isinstance(val, str) else fallback
 
 
 def load_bool_setting(name: str, default: bool) -> bool:
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APP_REG_PATH, 0, winreg.KEY_READ) as key:
-            val, _ = winreg.QueryValueEx(key, name)
-            return bool(val)
-    except OSError:
-        return default
+    val = _read_setting(name)
+    return default if val is None else bool(val)
 
 
 def save_bool_setting(name: str, value: bool) -> None:
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, APP_REG_PATH) as key:
-        winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, int(value))
+    _write_setting(name, winreg.REG_DWORD, int(value))
+
+
+def load_str_setting(name: str, default: str) -> str:
+    val = _read_setting(name)
+    return val if isinstance(val, str) else default
+
+
+def save_str_setting(name: str, value: str) -> None:
+    _write_setting(name, winreg.REG_SZ, value)
+
+
+def load_int_setting(name: str, default: int) -> int:
+    val = _read_setting(name)
+    return val if isinstance(val, int) else default
+
+
+def save_int_setting(name: str, value: int) -> None:
+    _write_setting(name, winreg.REG_DWORD, int(value))
 
 
 def is_autostart_enabled() -> bool:
@@ -720,12 +854,13 @@ def is_autostart_enabled() -> bool:
 def set_autostart_enabled(enabled: bool) -> None:
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_REG_PATH) as key:
         if enabled:
+            # --minimized: при автозапуску програма стартує одразу в треї, без вікна
             if getattr(sys, "frozen", False):
-                cmd = f'"{sys.executable}"'
+                cmd = f'"{sys.executable}" --minimized'
             else:
                 pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
                 exe = pyw if os.path.isfile(pyw) else sys.executable
-                cmd = f'"{exe}" "{os.path.abspath(__file__)}"'
+                cmd = f'"{exe}" "{os.path.abspath(__file__)}" --minimized'
             winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, cmd)
         else:
             try:
@@ -734,28 +869,38 @@ def set_autostart_enabled(enabled: bool) -> None:
                 pass
 
 
+def acquire_single_instance() -> bool:
+    """Повертає False, якщо програма вже запущена (іменований mutex Windows)."""
+    global _instance_mutex
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        _instance_mutex = kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME}")
+        return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
+TRANSCODED_WALLPAPER = os.path.join(
+    os.environ.get("APPDATA", ""),
+    r"Microsoft\Windows\Themes\TranscodedWallpaper",
+)
+
+
 def get_wallpaper_path() -> str | None:
     buf = ctypes.create_unicode_buffer(512)
     if user32.SystemParametersInfoW(SPI_GETDESKWALLPAPER, len(buf), buf, 0) and buf.value:
         if os.path.isfile(buf.value):
             return buf.value
-
-    transcoded = os.path.join(
-        os.environ.get("APPDATA", ""),
-        r"Microsoft\Windows\Themes\TranscodedWallpaper",
-    )
-    return transcoded if os.path.isfile(transcoded) else None
+    return TRANSCODED_WALLPAPER if os.path.isfile(TRANSCODED_WALLPAPER) else None
 
 
 def get_wallpaper_signature() -> tuple[str | None, float]:
     path = get_wallpaper_path()
-    transcoded = os.path.join(
-        os.environ.get("APPDATA", ""),
-        r"Microsoft\Windows\Themes\TranscodedWallpaper",
-    )
     mtime = 0.0
-    for candidate in (transcoded, path):
-        if candidate and os.path.isfile(candidate):
+    for candidate in (TRANSCODED_WALLPAPER, path):
+        if candidate:
             try:
                 mtime = max(mtime, os.path.getmtime(candidate))
             except OSError:
@@ -765,10 +910,21 @@ def get_wallpaper_signature() -> tuple[str | None, float]:
 
 # --- Аналіз палітри шпалер ---
 
+# Достатньо для прев'ю (420x146) і палітри (72x72); 4K-шпалери не тягнемо в пам'яті повністю
+WALLPAPER_WORK_SIZE = 840
+
+
 def load_wallpaper_image(image_path: str) -> Image.Image:
+    """Завантажує шпалери одразу в зменшеному вигляді (для JPEG — через draft-декодування)."""
     with open(image_path, "rb") as f:
         data = f.read()
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    img = Image.open(io.BytesIO(data))
+    img.draft("RGB", (WALLPAPER_WORK_SIZE, WALLPAPER_WORK_SIZE))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img.thumbnail((WALLPAPER_WORK_SIZE, WALLPAPER_WORK_SIZE), Image.Resampling.BILINEAR)
+    img.load()
+    return img
 
 
 def extract_wallpaper_palette(img: Image.Image, max_colors: int = 6) -> list[tuple[int, int, int]]:
@@ -863,10 +1019,12 @@ def create_tray_icon_image(
 # --- Головне вікно та системний трей ---
 
 class WallpaperAccentApp:
-    def __init__(self) -> None:
+    def __init__(self, start_hidden: bool = False) -> None:
         ensure_initial_backup()
 
         self.root = tk.Tk()
+        if start_hidden:
+            self.root.withdraw()
         self.root.title("Wallpaper Accent Sync")
         self.root.configure(bg="#1C1C1E")
         self.root.resizable(False, False)
@@ -877,6 +1035,13 @@ class WallpaperAccentApp:
         self._enable_selection_val: bool = load_bool_setting("EnableSelection", True)
         self._separate_colors_val: bool = load_bool_setting("SeparateColors", False)
         self._revert_on_exit_val: bool = load_bool_setting("RevertOnExit", False)
+
+        # Налаштування розміру курсора ("auto" або "manual")
+        saved_mode = load_str_setting("CursorSizeMode", "auto")
+        self._cursor_size_mode: str = saved_mode if saved_mode in ("auto", "manual") else "auto"
+        saved_custom = load_int_setting("CursorCustomSize", 32)
+        self._cursor_custom_size: int = saved_custom if saved_custom in CURSOR_SIZE_PRESETS else 32
+        self._last_system_cursor_size: int = get_system_cursor_base_size()
 
         self.auto_apply = tk.BooleanVar(value=self._auto_apply_val)
         self.enable_cursor = tk.BooleanVar(value=self._enable_cursor_val)
@@ -898,8 +1063,26 @@ class WallpaperAccentApp:
         self.last_signature: tuple[str | None, float] = (None, 0.0)
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.tray_icon: Any = None
+        self.size_buttons: dict[str, tk.Button] = {}
+
+        self._shutting_down = False
+        self._fit_pending = False
+        self._sync_failures = 0
+        self._poll_job: str | None = None
+        self._tray_thread: threading.Thread | None = None
+        # Кеш застосованого стану: не перегенеровуємо курсори й не пишемо в реєстр без потреби.
+        # True / None означають «стан невідомий», тож перший виклик гарантовано синхронізує систему.
+        self._cursor_custom_active = True
+        self._selection_custom_active = True
+        self._cursor_key: tuple[tuple[int, int, int], int] | None = None
+        self._selection_key: tuple[int, int, int] | None = None
 
         self._build_ui()
+        # Висота вікна залежить від вмісту, який з'являється пізніше (картки палітри, режими статусу),
+        # тож підганяємо вікно щоразу, коли ці блоки змінюють розмір
+        for widget in (self.cards_frame, self.status_container):
+            widget.bind("<Configure>", lambda _: self._schedule_fit())
+        self._refresh_size_buttons()
         self._refresh_status_area()
         self._fit_and_center_window()
 
@@ -911,12 +1094,26 @@ class WallpaperAccentApp:
             self.sync_from_wallpaper(force_apply=False)
             self._apply_current_targets()
 
+        self._fit_and_center_window()  # тепер, коли палітра вже відображена, висота остаточна
         self.root.after(0, self._start_tray)
-        self.root.after(1500, self._poll_wallpaper_changes)
+        self._poll_job = self.root.after(1500, self._poll_system_changes)
+
+    def _get_effective_cursor_size(self) -> int:
+        if self._cursor_size_mode == "auto":
+            return get_system_cursor_base_size()
+        return self._cursor_custom_size
+
+    def _post(self, fn) -> None:
+        """Безпечно ставить виклик у чергу головного потоку Tk (для колбеків трея)."""
+        try:
+            self.root.after(0, fn)
+        except (RuntimeError, tk.TclError):
+            pass
 
     def _start_tray(self) -> None:
         self.tray_icon = self._create_tray_icon()
-        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        self._tray_thread = threading.Thread(target=self.tray_icon.run, daemon=True)
+        self._tray_thread.start()
 
     def _build_ui(self) -> None:
         bg_main = "#1C1C1E"
@@ -990,6 +1187,34 @@ class WallpaperAccentApp:
         )
         self.selection_target_card.pack(side="left", fill="x", expand=True, padx=(4, 0))
 
+        # --- Панель вибору розміру курсора ---
+        size_row = tk.Frame(self.root, bg=bg_main)
+        size_row.pack(fill="x", padx=16, pady=(2, 8))
+
+        tk.Label(
+            size_row,
+            text="Розмір курсора:",
+            bg=bg_main,
+            fg=fg_muted,
+            font=("Segoe UI", 9),
+        ).pack(side="left", padx=(0, 8))
+
+        self.size_buttons["auto"] = self._make_size_pill_button(
+            size_row,
+            text="Авто",
+            command=lambda: self._select_cursor_size("auto", self._cursor_custom_size),
+        )
+        self.size_buttons["auto"].pack(side="left", padx=(0, 4))
+
+        for px in CURSOR_SIZE_PRESETS:
+            key = str(px)
+            self.size_buttons[key] = self._make_size_pill_button(
+                size_row,
+                text=f"{px} px",
+                command=lambda sz=px: self._select_cursor_size("manual", sz),
+            )
+            self.size_buttons[key].pack(side="left", padx=(0, 4))
+
         # Блок налаштувань
         opts_frame = tk.Frame(self.root, bg=bg_main)
         opts_frame.pack(fill="x", padx=13, pady=(0, 10))
@@ -1060,6 +1285,44 @@ class WallpaperAccentApp:
             hover_bg="#522E35",
         ).pack(side="left")
         self._make_button(btn_row2, "У трей", self.hide_window, width=14).pack(side="right")
+
+    @staticmethod
+    def _make_size_pill_button(parent: tk.Widget, text: str, command) -> tk.Button:
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg="#26262A",
+            fg="#B8B8BE",
+            activebackground="#3E3E46",
+            activeforeground="#FFFFFF",
+            relief="flat",
+            bd=0,
+            padx=7,
+            pady=3,
+            font=("Segoe UI", 8),
+            cursor="hand2",
+        )
+
+    def _refresh_size_buttons(self) -> None:
+        active_key = "auto" if self._cursor_size_mode == "auto" else str(self._cursor_custom_size)
+        for key, btn in self.size_buttons.items():
+            is_active = key == active_key
+            btn.configure(
+                bg="#3E3E48" if is_active else "#26262A",
+                fg="#FFFFFF" if is_active else "#B8B8BE",
+                font=("Segoe UI", 8, "bold" if is_active else "normal"),
+            )
+
+    def _select_cursor_size(self, mode: str, custom_px: int) -> None:
+        self._cursor_size_mode = mode
+        self._cursor_custom_size = custom_px
+        save_str_setting("CursorSizeMode", mode)
+        save_int_setting("CursorCustomSize", custom_px)
+        self._refresh_size_buttons()
+
+        if self._enable_cursor_val and not self.is_default_state:
+            self._apply_cursor()
 
     def _create_target_pill(
         self, parent: tk.Widget, title: str, on_click
@@ -1153,55 +1416,72 @@ class WallpaperAccentApp:
         y = (sh - h) // 2
         self.root.geometry(f"{w}x{h}+{x}+{y}")
 
+    def _schedule_fit(self) -> None:
+        if not self._fit_pending:
+            self._fit_pending = True
+            self.root.after_idle(self._fit_window)
+
+    def _fit_window(self) -> None:
+        """Підганяє розмір вікна під вміст, не рухаючи його по екрану."""
+        self._fit_pending = False
+        try:
+            self.root.update_idletasks()
+            w = max(456, self.root.winfo_reqwidth())
+            h = self.root.winfo_reqheight()
+            if (w, h) != (self.root.winfo_width(), self.root.winfo_height()):
+                self.root.geometry(f"{w}x{h}")
+        except tk.TclError:
+            pass
+
     def _create_tray_icon(self) -> Any:
         menu = pystray.Menu(
             pystray.MenuItem(
                 "Відкрити палітру кольорів",
-                lambda: self.root.after(0, self.toggle_window),
+                lambda: self._post(self.toggle_window),
                 default=True,
             ),
             pystray.MenuItem(
                 "Оновити зі шпалер",
-                lambda: self.root.after(0, lambda: self.sync_from_wallpaper(force_apply=True)),
+                lambda: self._post(lambda: self.sync_from_wallpaper(force_apply=True)),
             ),
             pystray.MenuItem(
                 "Повернути стандартний вигляд",
-                lambda: self.root.after(0, self.reset_defaults),
+                lambda: self._post(self.reset_defaults),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Змінювати курсор",
-                lambda: self.root.after(0, self._toggle_cursor_from_tray),
+                lambda: self._post(self._toggle_cursor_from_tray),
                 checked=lambda _: self._enable_cursor_val,
             ),
             pystray.MenuItem(
                 "Змінювати виділення",
-                lambda: self.root.after(0, self._toggle_selection_from_tray),
+                lambda: self._post(self._toggle_selection_from_tray),
                 checked=lambda _: self._enable_selection_val,
             ),
             pystray.MenuItem(
                 "Окремі кольори (курсор / виділення)",
-                lambda: self.root.after(0, self._toggle_separate_from_tray),
+                lambda: self._post(self._toggle_separate_from_tray),
                 checked=lambda _: self._separate_colors_val,
             ),
             pystray.MenuItem(
                 "Автопідбір зі шпалер",
-                lambda: self.root.after(0, self._toggle_auto_apply_from_tray),
+                lambda: self._post(self._toggle_auto_apply_from_tray),
                 checked=lambda _: self._auto_apply_val,
             ),
             pystray.MenuItem(
                 "Відкат до стандартного при виході",
-                lambda: self.root.after(0, self._toggle_revert_on_exit_from_tray),
+                lambda: self._post(self._toggle_revert_on_exit_from_tray),
                 checked=lambda _: self._revert_on_exit_val,
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 "Видалити налаштування з системи",
-                lambda: self.root.after(0, self.uninstall_and_quit),
+                lambda: self._post(self.uninstall_and_quit),
             ),
             pystray.MenuItem(
                 "Вихід",
-                lambda: self.root.after(0, lambda: self.quit_app(restore_before_quit=self._revert_on_exit_val)),
+                lambda: self._post(lambda: self.quit_app(restore_before_quit=self._revert_on_exit_val)),
             ),
         )
         return pystray.Icon(
@@ -1240,24 +1520,29 @@ class WallpaperAccentApp:
         self._enable_selection_val = self.enable_selection.get()
         save_bool_setting("EnableCursor", self._enable_cursor_val)
         save_bool_setting("EnableSelection", self._enable_selection_val)
-        self._apply_current_targets()
+        # У «стандартному вигляді» перемикачі лише запам'ятовуються — інакше вони б мовчки
+        # замінили рідні курсори Windows синіми
+        if not self.is_default_state:
+            self._apply_current_targets()
 
     def _on_separate_colors_toggled(self) -> None:
         is_sep = self.separate_colors.get()
         self._separate_colors_val = is_sep
         save_bool_setting("SeparateColors", is_sep)
 
+        changed = False
         if not is_sep:
             self.selection_color = self.cursor_color
-            self._apply_current_targets()
+            changed = True
         elif self._auto_apply_val and len(self.palette) >= 2:
             self.selection_color = self.palette[1]
+            changed = True
+        if changed and not self.is_default_state:
             self._apply_current_targets()
 
         self._refresh_status_area()
         self._render_palette_cards()
         self._update_tray_appearance()
-        self._fit_and_center_window()
 
     def _on_auto_apply_toggled(self) -> None:
         enabled = self.auto_apply.get()
@@ -1273,19 +1558,66 @@ class WallpaperAccentApp:
     def _on_autostart_toggled(self) -> None:
         set_autostart_enabled(self.autostart.get())
 
+    def _sync_base_size(self) -> None:
+        """У ручному режимі виставляє CursorBaseSize; в «Авто» повертає розмір користувача."""
+        current = get_system_cursor_base_size()
+        original = load_int_setting(ORIGINAL_BASE_SIZE_SETTING, 0)
+        if self._cursor_size_mode == "manual":
+            if not original:
+                save_int_setting(ORIGINAL_BASE_SIZE_SETTING, current)
+            target = self._cursor_custom_size
+        elif original:
+            target = original
+            save_int_setting(ORIGINAL_BASE_SIZE_SETTING, 0)
+        else:
+            return
+        if target != current:
+            set_system_cursor_base_size(target)
+        self._last_system_cursor_size = target
+
+    def _apply_cursor(self) -> None:
+        self._sync_base_size()
+        size = self._get_effective_cursor_size()
+        key = (self.cursor_color, size)
+        if key == self._cursor_key:
+            return
+        apply_cursor_color(self.cursor_color, target_size=size)
+        self._cursor_key = key
+        self._cursor_custom_active = True
+
+    def _restore_cursor(self) -> None:
+        if self._cursor_custom_active:
+            reset_cursor_to_default()
+            self._cursor_custom_active = False
+            self._cursor_key = None
+
+    def _apply_selection(self) -> None:
+        if self.selection_color == self._selection_key:
+            return
+        apply_selection_color(self.selection_color)
+        self._selection_key = self.selection_color
+        self._selection_custom_active = True
+
+    def _restore_selection(self) -> None:
+        if self._selection_custom_active:
+            reset_selection_to_default()
+            self._selection_custom_active = False
+            self._selection_key = None
+
     def _apply_current_targets(self) -> None:
-        self.is_default_state = False
-        save_bool_setting("IsDefaultState", False)
+        if self.is_default_state:
+            self.is_default_state = False
+            save_bool_setting("IsDefaultState", False)
 
         if self._enable_cursor_val:
-            apply_cursor_color(self.cursor_color)
+            self._apply_cursor()
         else:
-            reset_cursor_to_default()
+            self._restore_cursor()
 
         if self._enable_selection_val:
-            apply_selection_color(self.selection_color)
+            self._apply_selection()
         else:
-            reset_selection_to_default()
+            self._restore_selection()
 
         save_active_accent_meta(self.cursor_color, self.selection_color)
 
@@ -1303,22 +1635,59 @@ class WallpaperAccentApp:
         self._render_palette_cards()
         self._update_tray_appearance()
 
-    def _poll_wallpaper_changes(self) -> None:
-        sig = get_wallpaper_signature()
-        if sig != self.last_signature and sig[0] is not None:
-            self.sync_from_wallpaper(force_apply=self._auto_apply_val)
-        self.root.after(1500, self._poll_wallpaper_changes)
+    def _poll_system_changes(self) -> None:
+        self._poll_job = None
+        if self._shutting_down:
+            return
+        try:
+            sig = get_wallpaper_signature()
+            if sig[0] is not None and sig != self.last_signature:
+                self.sync_from_wallpaper(force_apply=self._auto_apply_val, sig=sig)
 
-    def sync_from_wallpaper(self, force_apply: bool) -> None:
-        sig = get_wallpaper_signature()
+            # Відстежуємо зміну системного розміру курсора в режимі "Авто"
+            sys_size = get_system_cursor_base_size()
+            if sys_size != self._last_system_cursor_size:
+                self._last_system_cursor_size = sys_size
+                if self._enable_cursor_val and not self.is_default_state:
+                    if self._cursor_size_mode == "auto":
+                        self._apply_cursor()
+                    elif sys_size != self._cursor_custom_size:
+                        # Розмір змінили в налаштуваннях Windows: запам'ятовуємо для «Авто»,
+                        # а ручний розмір програми повертаємо
+                        save_int_setting(ORIGINAL_BASE_SIZE_SETTING, sys_size)
+                        self._cursor_key = None
+                        self._apply_cursor()
+        except Exception:
+            pass
+        finally:
+            # Одна помилка не повинна назавжди зупиняти відстеження
+            if not self._shutting_down:
+                try:
+                    self._poll_job = self.root.after(1500, self._poll_system_changes)
+                except tk.TclError:
+                    pass
+
+    def sync_from_wallpaper(
+        self, force_apply: bool, sig: tuple[str | None, float] | None = None
+    ) -> None:
+        sig = sig or get_wallpaper_signature()
         path = sig[0]
         if not path:
             return
 
         try:
             img = load_wallpaper_image(path)
-            self.last_signature = sig
+        except Exception:
+            # Файл може бути недописаний у момент зміни шпалер — пробуємо ще, але не вічно
+            self._sync_failures += 1
+            if self._sync_failures >= 3:
+                self._sync_failures = 0
+                self.last_signature = sig
+            return
+        self._sync_failures = 0
+        self.last_signature = sig
 
+        try:
             thumb = img.copy()
             thumb.thumbnail((420, 146), Image.Resampling.LANCZOS)
             self.preview_photo = ImageTk.PhotoImage(thumb)
@@ -1327,6 +1696,9 @@ class WallpaperAccentApp:
             self.palette = extract_wallpaper_palette(img, max_colors=6)
 
             if force_apply and self.palette:
+                # Явне/автоматичне оновлення за шпалерами — застосовуємо наново без урахування кешу
+                self._cursor_key = None
+                self._selection_key = None
                 self._apply_palette_automatically()
             else:
                 self._refresh_status_area()
@@ -1364,6 +1736,8 @@ class WallpaperAccentApp:
 
         reset_cursor_to_default()
         reset_selection_to_default()
+        self._cursor_custom_active = self._selection_custom_active = False
+        self._cursor_key = self._selection_key = None
         save_active_accent_meta(default_rgb, default_rgb)
         save_bool_setting("IsDefaultState", True)
 
@@ -1384,7 +1758,23 @@ class WallpaperAccentApp:
         if not confirmed:
             return
 
-        perform_full_uninstall_cleanup()
+        # Зупиняємо опитування, інакше воно могло б знову записати налаштування вже після очищення
+        self._shutting_down = True
+        if self._poll_job is not None:
+            try:
+                self.root.after_cancel(self._poll_job)
+            except tk.TclError:
+                pass
+            self._poll_job = None
+        try:
+            perform_full_uninstall_cleanup()
+        except Exception as exc:
+            self._shutting_down = False
+            self._poll_job = self.root.after(1500, self._poll_system_changes)
+            messagebox.showerror(
+                "Помилка", f"Не вдалося повністю видалити налаштування:\n{exc}", parent=self.root
+            )
+            return
         messagebox.showinfo(
             "Готово",
             "Усі системні налаштування повернуто до стандартних, автозапуск і тимчасові файли очищено.\n\nЗараз програма закриється — після цього файл програми можна спокійно видалити.",
@@ -1552,11 +1942,18 @@ class WallpaperAccentApp:
 
     def quit_app(self, restore_before_quit: bool | None = None) -> None:
         should_restore = self._revert_on_exit_val if restore_before_quit is None else restore_before_quit
+        self._shutting_down = True
         if should_restore:
-            reset_cursor_to_default()
-            reset_selection_to_default()
+            try:
+                reset_cursor_to_default()
+                reset_selection_to_default()
+            except Exception:
+                pass
         if self.tray_icon is not None:
             self.tray_icon.stop()
+            # Дочікуємося зняття іконки, інакше в треї залишається «привид» до наведення миші
+            if self._tray_thread is not None:
+                self._tray_thread.join(timeout=1.5)
         self.root.destroy()
 
     def run(self) -> None:
@@ -1575,4 +1972,8 @@ if __name__ == "__main__":
         save_bool_setting("IsDefaultState", True)
         sys.exit(0)
 
-    WallpaperAccentApp().run()
+    # Другий екземпляр створив би другу іконку в треї й конфліктував би з першим
+    if not acquire_single_instance():
+        sys.exit(0)
+
+    WallpaperAccentApp(start_hidden="--minimized" in args).run()
